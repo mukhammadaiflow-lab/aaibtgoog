@@ -1,0 +1,647 @@
+// Prisma Schema for AI Automation Platform
+// Based on research: n8n patterns, Temporal.io durable execution, enterprise workflows
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===============================
+// USER & AUTHENTICATION
+// ===============================
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String?
+  name            String?
+  avatar          String?
+  role            UserRole  @default(MEMBER)
+  status          UserStatus @default(ACTIVE)
+  emailVerified   DateTime?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  // MFA
+  mfaEnabled      Boolean   @default(false)
+  mfaSecret       String?
+  mfaBackupCodes  String[]
+  
+  // SSO
+  ssoProvider     String?
+  ssoProviderId   String?
+  
+  // Relations
+  organization    Organization? @relation(fields: [organizationId], references: [id])
+  organizationId  String?
+  apiKeys         ApiKey[]
+  sessions        Session[]
+  workflows       Workflow[]
+  executions      Execution[]
+  credentials     Credential[]
+  auditLogs       AuditLog[]
+  comments        WorkflowComment[]
+  notifications   Notification[]
+  
+  @@index([email])
+  @@index([organizationId])
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+  GUEST
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  token        String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  lastActiveAt DateTime @default(now())
+  
+  @@index([userId])
+  @@index([token])
+}
+
+model ApiKey {
+  id          String    @id @default(cuid())
+  name        String
+  keyHash     String    @unique
+  keyPrefix   String
+  permissions String[]
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rateLimit   Int       @default(1000)
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  
+  @@index([keyHash])
+  @@index([userId])
+}
+
+// ===============================
+// ORGANIZATION & TEAMS
+// ===============================
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  logo          String?
+  plan          PlanType @default(FREE)
+  stripeCustomerId String?
+  stripeSubscriptionId String?
+  
+  // Limits
+  maxUsers      Int      @default(5)
+  maxWorkflows  Int      @default(10)
+  maxExecutions Int      @default(1000) // per month
+  
+  // Settings
+  settings      Json     @default("{}")
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relations
+  members       User[]
+  workflows     Workflow[]
+  credentials   Credential[]
+  environments  Environment[]
+  
+  @@index([slug])
+}
+
+enum PlanType {
+  FREE
+  STARTER
+  PRO
+  BUSINESS
+  ENTERPRISE
+}
+
+// ===============================
+// WORKFLOWS
+// ===============================
+
+model Workflow {
+  id              String          @id @default(cuid())
+  name            String
+  description     String?
+  status          WorkflowStatus  @default(DRAFT)
+  version         Int             @default(1)
+  
+  // Canvas Data
+  nodes           Json            // Array of node definitions
+  edges           Json            // Array of edge connections
+  viewport        Json?           // Zoom and position
+  
+  // Workflow Settings
+  settings        Json            @default("{}")
+  retryPolicy     Json?           // Retry configuration
+  timeout         Int?            // Max execution time in seconds
+  
+  // Trigger Configuration
+  triggerType     TriggerType?
+  triggerConfig   Json?
+  webhookPath     String?         @unique
+  webhookSecret   String?
+  cronExpression  String?
+  
+  // Metadata
+  tags            String[]        @default([])
+  isTemplate      Boolean         @default(false)
+  isPublic        Boolean         @default(false)
+  
+  // Ownership
+  userId          String
+  user            User            @relation(fields: [userId], references: [id])
+  organizationId  String?
+  organization    Organization?   @relation(fields: [organizationId], references: [id])
+  
+  // Timestamps
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  publishedAt     DateTime?
+  lastExecutedAt  DateTime?
+  
+  // Relations
+  executions      Execution[]
+  versions        WorkflowVersion[]
+  comments        WorkflowComment[]
+  schedules       Schedule[]
+  
+  @@index([userId])
+  @@index([organizationId])
+  @@index([status])
+  @@index([webhookPath])
+}
+
+enum WorkflowStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+  ERROR
+}
+
+enum TriggerType {
+  MANUAL
+  WEBHOOK
+  SCHEDULE
+  EVENT
+  POLLING
+}
+
+model WorkflowVersion {
+  id          String   @id @default(cuid())
+  workflowId  String
+  workflow    Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  version     Int
+  nodes       Json
+  edges       Json
+  settings    Json?
+  changelog   String?
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  
+  @@unique([workflowId, version])
+  @@index([workflowId])
+}
+
+model WorkflowComment {
+  id          String   @id @default(cuid())
+  workflowId  String
+  workflow    Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  nodeId      String?  // Optional: comment on specific node
+  content     String
+  resolved    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([workflowId])
+}
+
+// ===============================
+// EXECUTIONS (Durable State)
+// ===============================
+
+model Execution {
+  id            String           @id @default(cuid())
+  workflowId    String
+  workflow      Workflow         @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  userId        String?
+  user          User?            @relation(fields: [userId], references: [id])
+  
+  // Execution State
+  status        ExecutionStatus  @default(PENDING)
+  mode          ExecutionMode    @default(PRODUCTION)
+  priority      ExecutionPriority @default(NORMAL)
+  
+  // Input/Output
+  input         Json?            // Trigger data
+  output        Json?            // Final output
+  context       Json?            // Shared context between nodes
+  
+  // Timing
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  duration      Int?             // milliseconds
+  
+  // Error Handling
+  error         Json?            // Error details if failed
+  retryCount    Int              @default(0)
+  maxRetries    Int              @default(3)
+  retryAfter    DateTime?
+  
+  // Metadata
+  triggeredBy   String?          // What triggered: webhook, schedule, manual, etc.
+  metadata      Json?
+  
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  
+  // Relations - Event Sourcing
+  events        ExecutionEvent[]
+  nodeExecutions NodeExecution[]
+  
+  @@index([workflowId])
+  @@index([status])
+  @@index([startedAt])
+  @@index([userId])
+}
+
+enum ExecutionStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  WAITING    // Waiting for external event
+  PAUSED
+  SUCCESS
+  FAILED
+  CANCELLED
+  TIMEOUT
+}
+
+enum ExecutionMode {
+  PRODUCTION
+  TEST
+  DEBUG
+}
+
+enum ExecutionPriority {
+  CRITICAL
+  HIGH
+  NORMAL
+  LOW
+}
+
+// Event Sourcing: Every step is recorded for replay
+model ExecutionEvent {
+  id           String        @id @default(cuid())
+  executionId  String
+  execution    Execution     @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  
+  eventType    EventType
+  nodeId       String?
+  data         Json
+  timestamp    DateTime      @default(now())
+  
+  @@index([executionId])
+  @@index([eventType])
+}
+
+enum EventType {
+  WORKFLOW_STARTED
+  WORKFLOW_COMPLETED
+  WORKFLOW_FAILED
+  NODE_STARTED
+  NODE_COMPLETED
+  NODE_FAILED
+  NODE_SKIPPED
+  WAITING_FOR_EVENT
+  EVENT_RECEIVED
+  RETRY_SCHEDULED
+  TIMEOUT
+  CANCELLED
+}
+
+// Per-node execution details
+model NodeExecution {
+  id            String           @id @default(cuid())
+  executionId   String
+  execution     Execution        @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  
+  nodeId        String           // Reference to node in workflow.nodes
+  nodeType      String
+  nodeName      String?
+  
+  status        NodeExecutionStatus @default(PENDING)
+  
+  input         Json?
+  output        Json?
+  error         Json?
+  
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  duration      Int?             // milliseconds
+  
+  retryCount    Int              @default(0)
+  
+  @@unique([executionId, nodeId])
+  @@index([executionId])
+  @@index([status])
+}
+
+enum NodeExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+  SKIPPED
+  WAITING
+}
+
+// ===============================
+// SCHEDULING
+// ===============================
+
+model Schedule {
+  id            String        @id @default(cuid())
+  workflowId    String
+  workflow      Workflow      @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  
+  name          String?
+  cronExpression String
+  timezone      String        @default("UTC")
+  enabled       Boolean       @default(true)
+  
+  // Scheduling State
+  nextRunAt     DateTime?
+  lastRunAt     DateTime?
+  lastStatus    ExecutionStatus?
+  
+  // Config
+  input         Json?         // Default input for scheduled runs
+  
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  
+  @@index([workflowId])
+  @@index([nextRunAt])
+  @@index([enabled])
+}
+
+// ===============================
+// CREDENTIALS
+// ===============================
+
+model Credential {
+  id              String       @id @default(cuid())
+  name            String
+  type            String       // oauth2, api_key, basic, etc.
+  provider        String       // slack, github, openai, etc.
+  
+  // Encrypted credential data
+  encryptedData   String
+  
+  // OAuth2 specific
+  accessToken     String?
+  refreshToken    String?
+  tokenExpiresAt  DateTime?
+  
+  // Ownership
+  userId          String
+  user            User         @relation(fields: [userId], references: [id])
+  organizationId  String?
+  organization    Organization? @relation(fields: [organizationId], references: [id])
+  
+  // Metadata
+  metadata        Json?
+  lastUsedAt      DateTime?
+  expiresAt       DateTime?
+  
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  
+  @@unique([userId, name])
+  @@index([userId])
+  @@index([provider])
+}
+
+// ===============================
+// ENVIRONMENTS
+// ===============================
+
+model Environment {
+  id              String       @id @default(cuid())
+  name            String
+  slug            String
+  description     String?
+  color           String?
+  
+  variables       Json         @default("{}")
+  secrets         String?      // Encrypted
+  
+  organizationId  String
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  
+  isProduction    Boolean      @default(false)
+  
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  
+  @@unique([organizationId, slug])
+  @@index([organizationId])
+}
+
+// ===============================
+// AUDIT & LOGGING
+// ===============================
+
+model AuditLog {
+  id            String    @id @default(cuid())
+  userId        String?
+  user          User?     @relation(fields: [userId], references: [id])
+  
+  action        String    // create, update, delete, execute, login, etc.
+  entityType    String    // workflow, credential, user, etc.
+  entityId      String?
+  
+  oldValue      Json?
+  newValue      Json?
+  
+  ipAddress     String?
+  userAgent     String?
+  
+  riskLevel     RiskLevel @default(LOW)
+  
+  timestamp     DateTime  @default(now())
+  
+  @@index([userId])
+  @@index([action])
+  @@index([entityType])
+  @@index([timestamp])
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// ===============================
+// NOTIFICATIONS
+// ===============================
+
+model Notification {
+  id          String            @id @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type        NotificationType
+  title       String
+  message     String
+  data        Json?
+  
+  priority    NotificationPriority @default(NORMAL)
+  channel     String[]          @default(["in_app"])
+  
+  read        Boolean           @default(false)
+  readAt      DateTime?
+  
+  createdAt   DateTime          @default(now())
+  expiresAt   DateTime?
+  
+  @@index([userId])
+  @@index([read])
+  @@index([createdAt])
+}
+
+enum NotificationType {
+  WORKFLOW_SUCCESS
+  WORKFLOW_FAILED
+  WORKFLOW_WARNING
+  SYSTEM_ALERT
+  TEAM_INVITE
+  COMMENT_MENTION
+  SCHEDULE_REMINDER
+  USAGE_ALERT
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+// ===============================
+// TEMPLATES
+// ===============================
+
+model Template {
+  id            String    @id @default(cuid())
+  name          String
+  slug          String    @unique
+  description   String?
+  longDescription String?
+  
+  category      String
+  subcategory   String?
+  tags          String[]  @default([])
+  
+  icon          String?
+  color         String?
+  
+  // Template Content
+  nodes         Json
+  edges         Json
+  variables     Json      @default("[]")
+  
+  // Requirements
+  requiredCredentials String[] @default([])
+  requiredNodes       String[] @default([])
+  
+  // Metadata
+  difficulty    String    @default("beginner")
+  estimatedTime String?
+  
+  // Stats
+  installs      Int       @default(0)
+  rating        Float?
+  reviewCount   Int       @default(0)
+  
+  // Authorship
+  authorId      String?
+  authorName    String?
+  verified      Boolean   @default(false)
+  featured      Boolean   @default(false)
+  premium       Boolean   @default(false)
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  @@index([category])
+  @@index([featured])
+  @@index([installs])
+}
+
+// ===============================
+// WEBHOOKS
+// ===============================
+
+model WebhookDelivery {
+  id            String    @id @default(cuid())
+  workflowId    String
+  
+  // Request
+  method        String
+  path          String
+  headers       Json
+  body          Json?
+  queryParams   Json?
+  
+  // Response
+  statusCode    Int?
+  responseBody  Json?
+  
+  // Metadata
+  ipAddress     String
+  userAgent     String?
+  
+  // Processing
+  processed     Boolean   @default(false)
+  executionId   String?
+  error         String?
+  
+  receivedAt    DateTime  @default(now())
+  processedAt   DateTime?
+  
+  @@index([workflowId])
+  @@index([receivedAt])
+  @@index([processed])
+}
